@@ -67,10 +67,6 @@ services:
         image: fosrl/newt
         container_name: mcp-oauth-newt
         restart: always
-        extra_hosts:
-          # === Pangolin Server Location ===
-          # Update IP address to match your Pangolin server
-          - "${PANGOLIN_HOST:-pangolin.example.com}:${PANGOLIN_IP}"
         environment:
             # === Pangolin Connection Settings ===
             # Your Pangolin server endpoint
