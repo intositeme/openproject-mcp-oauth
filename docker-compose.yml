@@ -1,18 +1,18 @@
 name: openproject-mcp-oauth
 
 services:
-  # The actual OpenProject MCP Server (internal, not exposed)
-  openproject-mcp-server:
-    build: https://github.com/firsthalfhero/openproject-mcp-server.git
-    container_name: openproject-mcp-server
+  # SSE Bridge - Converts stdio MCP server to HTTP/SSE
+  mcp-sse-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: mcp-sse-bridge
     environment:
       # === OpenProject Connection Settings ===
       - OPENPROJECT_URL=${OPENPROJECT_URL}
       - OPENPROJECT_API_KEY=${OPENPROJECT_API_KEY}
       
-      # === MCP Server Settings (Internal) ===
-      - MCP_HOST=0.0.0.0
-      - MCP_PORT=8081
+      # === MCP Server Settings ===
       - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
       - OPENPROJECT_CACHE_TIMEOUT_MINUTES=${CACHE_TIMEOUT:-5}
       - OPENPROJECT_PAGINATION_SIZE=${PAGINATION_SIZE:-100}
@@ -30,9 +30,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
   
-  # OAuth Wrapper (protects the MCP server with MCP OAuth spec)
+  # OAuth Wrapper (protects the MCP server with OAuth)
   oauth-wrapper:
     build:
       context: .
@@ -46,20 +46,24 @@ services:
       # === Public URL Settings ===
       - BASE_URL=${BASE_URL}
       
-      # === Internal MCP Server URL ===
-      - MCP_SERVER_URL=http://openproject-mcp-server:8081
+      # === Internal MCP SSE Bridge URL ===
+      - MCP_SERVER_URL=http://mcp-sse-bridge:8081
     volumes:
       - ${DATA_PATH:-./data}/oauth-data:/app/data
     networks:
       - mcp-network
     restart: unless-stopped
     depends_on:
-      openproject-mcp-server:
+      mcp-sse-bridge:
         condition: service_healthy
     expose:
       - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  
   # Pangolin Newt Tunnel (exposes oauth-wrapper to the internet)
   mcp-oauth-newt:
     image: fosrl/newt
