@@ -1,0 +1,88 @@
+name: openproject-mcp-oauth
+services:
+    # The actual OpenProject MCP Server (internal, not exposed)
+    openproject-mcp-server:
+        build: https://github.com/firsthalfhero/openproject-mcp-server.git
+        container_name: openproject-mcp-server
+        environment:
+            # === OpenProject Connection Settings ===
+            # The URL of your OpenProject instance
+            - OPENPROJECT_URL=${OPENPROJECT_URL}
+            # Your OpenProject API token (40 characters)
+            # Get from: OpenProject → My Account → Access Tokens
+            - OPENPROJECT_API_KEY=${OPENPROJECT_API_KEY}
+            
+            # === MCP Server Settings (Internal) ===
+            - MCP_HOST=0.0.0.0
+            - MCP_PORT=8081
+            - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
+            - OPENPROJECT_CACHE_TIMEOUT_MINUTES=${CACHE_TIMEOUT:-5}
+            - OPENPROJECT_PAGINATION_SIZE=${PAGINATION_SIZE:-100}
+            - OPENPROJECT_MAX_RETRIES=${MAX_RETRIES:-3}
+        volumes:
+            - ${DATA_PATH:-./data}/mcp-logs:/app/logs
+            - ${DATA_PATH:-./data}/mcp-data:/app/data
+        networks:
+            - mcp-network
+        restart: unless-stopped
+        expose:
+            - "8081"
+    
+    # OAuth Wrapper (protects the MCP server)
+    oauth-wrapper:
+        build:
+            context: .
+            dockerfile: Dockerfile.oauth
+        container_name: oauth-wrapper
+        environment:
+            # === OAuth Configuration ===
+            # Secret key for signing JWT tokens (generate random string)
+            - OAUTH_SECRET_KEY=${OAUTH_SECRET_KEY}
+            # OAuth Client ID for Claude Custom Connector
+            - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+            # OAuth Client Secret for Claude Custom Connector
+            - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+            # Claude's OAuth callback URL (usually https://claude.ai/oauth/callback)
+            - OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI:-https://claude.ai/oauth/callback}
+            
+            # === Public URL Settings ===
+            # The public URL where this service is accessible
+            - BASE_URL=${BASE_URL}
+            
+            # === Internal MCP Server URL ===
+            # Points to the actual MCP server container
+            - MCP_SERVER_URL=http://openproject-mcp-server:8081/sse
+        volumes:
+            - ${DATA_PATH:-./data}/oauth-data:/app/data
+        networks:
+            - mcp-network
+        restart: unless-stopped
+        depends_on:
+            - openproject-mcp-server
+        expose:
+            - "8080"
+    
+    # Pangolin Newt Tunnel
+    mcp-oauth-newt:
+        image: fosrl/newt
+        container_name: mcp-oauth-newt
+        restart: always
+        extra_hosts:
+          # === Pangolin Server Location ===
+          # Update IP address to match your Pangolin server
+          - "${PANGOLIN_HOST:-pangolin.example.com}:${PANGOLIN_IP}"
+        environment:
+            # === Pangolin Connection Settings ===
+            # Your Pangolin server endpoint
+            - PANGOLIN_ENDPOINT=${PANGOLIN_ENDPOINT}
+            # Newt tunnel credentials from Pangolin
+            - NEWT_ID=${NEWT_ID}
+            - NEWT_SECRET=${NEWT_SECRET}
+        networks:
+            - mcp-network
+        depends_on:
+            - oauth-wrapper
+
+networks:
+    mcp-network:
+        driver: bridge
