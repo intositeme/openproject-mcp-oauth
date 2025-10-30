@@ -186,7 +186,8 @@ async def root_authorize(
 @app.post("/oauth/token")
 @app.post("/token")
 async def token(
-    grant_type: str,
+    request: Request,
+    grant_type: Optional[str] = None,
     code: Optional[str] = None,
     client_id: Optional[str] = None,
     client_secret: Optional[str] = None,
@@ -195,6 +196,20 @@ async def token(
     code_verifier: Optional[str] = None
 ):
     """OAuth token endpoint - Exchange authorization code for access token (supports PKCE)"""
+    
+    # Parse form data if not already parsed
+    if not grant_type:
+        form_data = await request.form()
+        grant_type = form_data.get("grant_type")
+        code = form_data.get("code")
+        client_id = form_data.get("client_id")
+        client_secret = form_data.get("client_secret")
+        redirect_uri = form_data.get("redirect_uri")
+        refresh_token = form_data.get("refresh_token")
+        code_verifier = form_data.get("code_verifier")
+    
+    # Log the token request for debugging
+    print(f"Token request - grant_type: {grant_type}, code present: {bool(code)}, client_id: {client_id}, code_verifier present: {bool(code_verifier)}")
     
     if grant_type == "authorization_code":
         # Validate authorization code
@@ -214,13 +229,18 @@ async def token(
         # Verify PKCE if code_challenge was provided
         if auth_data.get("code_challenge"):
             if not code_verifier:
+                print(f"ERROR: code_verifier required but not provided. code_challenge was: {auth_data.get('code_challenge')}")
                 raise HTTPException(status_code=400, detail="code_verifier required")
             
+            print(f"Verifying PKCE: code_verifier length={len(code_verifier)}, challenge_method={auth_data.get('code_challenge_method')}")
             if not verify_pkce(code_verifier, auth_data["code_challenge"], auth_data.get("code_challenge_method", "S256")):
+                print(f"ERROR: PKCE verification failed")
                 raise HTTPException(status_code=400, detail="Invalid code_verifier")
+            print("PKCE verification successful")
         else:
             # If no PKCE, validate client credentials
             if client_id != OAUTH_CLIENT_ID or client_secret != OAUTH_CLIENT_SECRET:
+                print(f"ERROR: Invalid client credentials. client_id match: {client_id == OAUTH_CLIENT_ID}")
                 raise HTTPException(status_code=401, detail="Invalid client credentials")
         
         # Mark code as used
