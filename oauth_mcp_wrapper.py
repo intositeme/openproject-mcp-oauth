@@ -80,9 +80,9 @@ async def oauth_discovery():
     Standard OAuth 2.0 Discovery (Claude expects this)
     """
     return {
-        "issuer": MCP_SERVER_URL,
-        "authorization_endpoint": f"{MCP_SERVER_URL}/oauth/authorize",
-        "token_endpoint": f"{MCP_SERVER_URL}/oauth/token",
+        "issuer": BASE_URL,
+        "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
+        "token_endpoint": f"{BASE_URL}/oauth/token",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -96,8 +96,8 @@ async def oauth_protected_resource():
     Optional but Claude probes this too
     """
     return {
-        "issuer": MCP_SERVER_URL,
-        "authorization_server": f"{MCP_SERVER_URL}/.well-known/oauth-authorization-server"
+        "issuer": BASE_URL,
+        "authorization_server": f"{BASE_URL}/.well-known/oauth-authorization-server"
     }
 
 @app.get("/authorize")
@@ -106,7 +106,7 @@ async def alias_authorize(request: Request):
     Redirect /authorize → /oauth/authorize
     """
     qs = request.url.query
-    return RedirectResponse(url=f"{MCP_SERVER_URL}/oauth/authorize?{qs}")
+    return RedirectResponse(url=f"{BASE_URL}/oauth/authorize?{qs}")
 
 
 @app.post("/token")
