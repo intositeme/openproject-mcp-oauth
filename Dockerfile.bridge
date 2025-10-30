@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    fastapi==0.104.1 \
+    uvicorn[standard]==0.24.0 \
+    httpx==0.25.1 \
+    python-multipart==0.0.6
+
+# Clone and install the OpenProject MCP server
+RUN apt-get update && \
+    apt-get install -y git && \
+    git clone https://github.com/firsthalfhero/openproject-mcp-server.git /tmp/mcp && \
+    cd /tmp/mcp && \
+    pip install --no-cache-dir -e . && \
+    apt-get remove -y git && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the SSE bridge
+COPY mcp_sse_bridge.py .
+
+# Expose port
+EXPOSE 8081
+
+# Run the bridge
+CMD ["python", "mcp_sse_bridge.py"]
