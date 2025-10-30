@@ -21,7 +21,7 @@ OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "openproject-mcp-server")
 OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", secrets.token_urlsafe(32))
 
 # Claude's official MCP OAuth callback URL
-CLAUDE_CALLBACK_URL = "https://claude.ai/api/mcp/auth_callback"
+CLAUDE_CALLBACK_URL =     "https://claude.ai/api/mcp/auth_callback"
 CLAUDE_CALLBACK_URL_ALT = "https://claude.com/api/mcp/auth_callback"
 CLAUDE_CALLBACK_URL_ALT2 = "https://claude.ai/oauth/callback"
 
@@ -32,6 +32,8 @@ refresh_tokens: Dict[str, Dict[str, Any]] = {}
 
 # Internal MCP server URL
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://openproject-mcp-server:8081")
+MCP_SERVER_SSE_URL = os.getenv("MCP_SERVER_SSE_URL", "http://openproject-mcp-server:39127")
+
 
 BASE_URL = os.getenv("BASE_URL", "https://this.mcpserver.domain")
 
