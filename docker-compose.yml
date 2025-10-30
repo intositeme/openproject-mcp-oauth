@@ -58,12 +58,7 @@ services:
         condition: service_healthy
     expose:
       - "8080"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+
   
   # Pangolin Newt Tunnel (exposes oauth-wrapper to the internet)
   mcp-oauth-newt:
@@ -77,8 +72,7 @@ services:
     networks:
       - mcp-network
     depends_on:
-      oauth-wrapper:
-        condition: service_healthy
+      - oauth-wrapper
 
 networks:
   mcp-network:
