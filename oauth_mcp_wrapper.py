@@ -1,355 +1,426 @@
 """
-OAuth-Protected MCP Server Wrapper
-Adds OAuth 2.0 authentication layer to the OpenProject MCP Server
-Supports PKCE (Proof Key for Code Exchange) for enhanced security
+MCP OAuth Server Wrapper for Claude AI
+Implements MCP OAuth specification (6/18) for Claude Custom Connectors
 """
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request
-from fastapi.security import OAuth2AuthorizationCodeBearer
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
-import json
-import hashlib
-import base64
-from datetime import datetime, timedelta
-from typing import Optional
 import secrets
 import uvicorn
-from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import json
+import asyncio
+from urllib.parse import urlencode
 
 # Configuration
-SECRET_KEY = os.getenv("OAUTH_SECRET_KEY", secrets.token_urlsafe(32))
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-
-# OAuth Configuration (for Custom Connectors)
 OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "openproject-mcp-server")
 OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", secrets.token_urlsafe(32))
-OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "https://claude.ai/oauth/callback")
 
-# In-memory token storage (use Redis/database in production)
-authorization_codes = {}
-access_tokens = {}
+# Claude's official MCP OAuth callback URL
+CLAUDE_CALLBACK_URL = "https://claude.ai/api/mcp/auth_callback"
+CLAUDE_CALLBACK_URL_ALT = "https://claude.com/api/mcp/auth_callback"
 
-app = FastAPI(title="OAuth-Protected OpenProject MCP Server")
+# Token storage (use Redis/database in production)
+authorization_codes: Dict[str, Dict[str, Any]] = {}
+access_tokens: Dict[str, Dict[str, Any]] = {}
+refresh_tokens: Dict[str, Dict[str, Any]] = {}
 
-# Add CORS middleware
+# Internal MCP server URL
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://openproject-mcp-server:8081")
+
+app = FastAPI(
+    title="OpenProject MCP Server with OAuth",
+    description="MCP OAuth-protected server for Claude AI",
+    version="1.0.0"
+)
+
+# CORS configuration for Claude
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://claude.ai",
+        "https://claude.com",
+        "https://*.claude.ai",
+        "https://*.claude.com"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    """Create a JWT access token"""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+def generate_token(prefix: str = "") -> str:
+    """Generate a secure random token"""
+    return f"{prefix}{secrets.token_urlsafe(32)}" if prefix else secrets.token_urlsafe(32)
 
 
-def verify_token(token: str) -> dict:
-    """Verify and decode JWT token"""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+def validate_redirect_uri(redirect_uri: str) -> bool:
+    """Validate that redirect URI is from Claude"""
+    allowed_uris = [CLAUDE_CALLBACK_URL, CLAUDE_CALLBACK_URL_ALT]
+    return redirect_uri in allowed_uris
 
 
-def verify_pkce(code_verifier: str, code_challenge: str, code_challenge_method: str = "S256") -> bool:
-    """Verify PKCE code challenge"""
-    if code_challenge_method == "S256":
-        # SHA256 hash of verifier, then base64url encode
-        hashed = hashlib.sha256(code_verifier.encode('ascii')).digest()
-        computed_challenge = base64.urlsafe_b64encode(hashed).decode('ascii').rstrip('=')
-        return computed_challenge == code_challenge
-    elif code_challenge_method == "plain":
-        return code_verifier == code_challenge
-    return False
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "openproject-mcp-oauth",
+        "timestamp": datetime.utcnow().isoformat(),
+        "mcp_server": MCP_SERVER_URL
+    }
 
 
-async def get_current_user(authorization: Optional[str] = None):
-    """Dependency to get current authenticated user from Bearer token"""
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+@app.get("/.well-known/mcp-oauth-server")
+async def mcp_oauth_metadata():
+    """
+    MCP OAuth Server Metadata Endpoint
+    Required by MCP OAuth spec
+    """
+    base_url = os.getenv("BASE_URL", "https://your-server.com")
     
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication scheme"
-            )
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header"
-        )
-    
-    payload = verify_token(token)
-    return payload
+    return {
+        "issuer": base_url,
+        "authorization_endpoint": f"{base_url}/oauth/authorize",
+        "token_endpoint": f"{base_url}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "scopes_supported": ["mcp"],
+        "service_documentation": f"{base_url}/docs"
+    }
 
 
-async def handle_authorization(
+@app.get("/oauth/authorize")
+async def authorize(
     response_type: str,
     client_id: str,
     redirect_uri: str,
+    state: str,
     scope: Optional[str] = None,
-    state: Optional[str] = None,
     code_challenge: Optional[str] = None,
-    code_challenge_method: Optional[str] = "S256"
+    code_challenge_method: Optional[str] = None
 ):
-    """Handle OAuth authorization request (supports PKCE)"""
-    
-    # Validate client_id
-    if client_id != OAUTH_CLIENT_ID:
-        raise HTTPException(status_code=400, detail="Invalid client_id")
+    """
+    OAuth Authorization Endpoint
+    Implements MCP OAuth spec authorization flow
+    """
     
     # Validate response_type
     if response_type != "code":
-        raise HTTPException(status_code=400, detail="Unsupported response_type")
+        return RedirectResponse(
+            url=f"{redirect_uri}?error=unsupported_response_type&state={state}"
+        )
+    
+    # Validate client_id
+    if client_id != OAUTH_CLIENT_ID:
+        return RedirectResponse(
+            url=f"{redirect_uri}?error=unauthorized_client&state={state}"
+        )
+    
+    # Validate redirect_uri (Claude's callback)
+    if not validate_redirect_uri(redirect_uri):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid redirect_uri. Expected {CLAUDE_CALLBACK_URL}"
+        )
     
     # Generate authorization code
-    auth_code = secrets.token_urlsafe(32)
+    auth_code = generate_token("auth_")
+    
+    # Store authorization code with PKCE challenge if provided
     authorization_codes[auth_code] = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": scope,
-        "expires_at": datetime.utcnow() + timedelta(minutes=10),
-        "used": False,
+        "scope": scope or "mcp",
         "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method
+        "code_challenge_method": code_challenge_method,
+        "created_at": datetime.utcnow(),
+        "expires_at": datetime.utcnow() + timedelta(minutes=10),
+        "used": False
     }
     
-    # Redirect back to client with authorization code
-    redirect_url = f"{redirect_uri}?code={auth_code}"
-    if state:
-        redirect_url += f"&state={state}"
+    # Redirect back to Claude with authorization code
+    params = {
+        "code": auth_code,
+        "state": state
+    }
     
+    redirect_url = f"{redirect_uri}?{urlencode(params)}"
     return RedirectResponse(url=redirect_url)
 
 
-# OAuth 2.0 Authorization Endpoint (both paths for compatibility)
-@app.get("/oauth/authorize")
-async def oauth_authorize(
-    response_type: str,
-    client_id: str,
-    redirect_uri: str,
-    scope: Optional[str] = None,
-    state: Optional[str] = None,
-    code_challenge: Optional[str] = None,
-    code_challenge_method: Optional[str] = "S256"
-):
-    """OAuth authorization endpoint - /oauth/authorize path"""
-    return await handle_authorization(
-        response_type, client_id, redirect_uri, scope, state, 
-        code_challenge, code_challenge_method
-    )
-
-
-@app.get("/authorize")
-async def root_authorize(
-    response_type: str,
-    client_id: str,
-    redirect_uri: str,
-    scope: Optional[str] = None,
-    state: Optional[str] = None,
-    code_challenge: Optional[str] = None,
-    code_challenge_method: Optional[str] = "S256"
-):
-    """OAuth authorization endpoint - /authorize path (for Claude compatibility)"""
-    return await handle_authorization(
-        response_type, client_id, redirect_uri, scope, state, 
-        code_challenge, code_challenge_method
-    )
-
-
-# OAuth 2.0 Token Endpoint
 @app.post("/oauth/token")
-@app.post("/token")
-async def token(
-    request: Request,
-    grant_type: Optional[str] = None,
-    code: Optional[str] = None,
-    client_id: Optional[str] = None,
-    client_secret: Optional[str] = None,
-    redirect_uri: Optional[str] = None,
-    refresh_token: Optional[str] = None,
-    code_verifier: Optional[str] = None
-):
-    """OAuth token endpoint - Exchange authorization code for access token (supports PKCE)"""
+async def token_endpoint(request: Request):
+    """
+    OAuth Token Endpoint
+    Exchanges authorization code for access token
+    Supports both authorization_code and refresh_token grants
+    """
     
-    # Parse form data if not already parsed
-    if not grant_type:
-        form_data = await request.form()
-        grant_type = form_data.get("grant_type")
+    # Parse form data
+    form_data = await request.form()
+    grant_type = form_data.get("grant_type")
+    
+    if grant_type == "authorization_code":
         code = form_data.get("code")
         client_id = form_data.get("client_id")
         client_secret = form_data.get("client_secret")
         redirect_uri = form_data.get("redirect_uri")
-        refresh_token = form_data.get("refresh_token")
         code_verifier = form_data.get("code_verifier")
-    
-    # Log the token request for debugging
-    print(f"Token request - grant_type: {grant_type}, code present: {bool(code)}, client_id: {client_id}, code_verifier present: {bool(code_verifier)}")
-    
-    if grant_type == "authorization_code":
-        # Validate authorization code
+        
+        # Validate authorization code exists
         if code not in authorization_codes:
             raise HTTPException(status_code=400, detail="Invalid authorization code")
         
         auth_data = authorization_codes[code]
         
-        # Check if code is expired
+        # Check expiration
         if datetime.utcnow() > auth_data["expires_at"]:
+            del authorization_codes[code]
             raise HTTPException(status_code=400, detail="Authorization code expired")
         
-        # Check if code was already used
+        # Check if already used
         if auth_data["used"]:
             raise HTTPException(status_code=400, detail="Authorization code already used")
         
-        # Verify PKCE if code_challenge was provided
+        # Validate client credentials
+        if client_id != OAUTH_CLIENT_ID:
+            raise HTTPException(status_code=401, detail="Invalid client_id")
+        
+        if client_secret != OAUTH_CLIENT_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid client_secret")
+        
+        # Validate redirect_uri matches
+        if redirect_uri != auth_data["redirect_uri"]:
+            raise HTTPException(status_code=400, detail="Redirect URI mismatch")
+        
+        # Validate PKCE if code_challenge was provided
         if auth_data.get("code_challenge"):
             if not code_verifier:
-                print(f"ERROR: code_verifier required but not provided. code_challenge was: {auth_data.get('code_challenge')}")
                 raise HTTPException(status_code=400, detail="code_verifier required")
             
-            print(f"Verifying PKCE: code_verifier length={len(code_verifier)}, challenge_method={auth_data.get('code_challenge_method')}")
-            if not verify_pkce(code_verifier, auth_data["code_challenge"], auth_data.get("code_challenge_method", "S256")):
-                print(f"ERROR: PKCE verification failed")
+            # Verify PKCE challenge (S256 method)
+            import hashlib
+            import base64
+            
+            verifier_hash = hashlib.sha256(code_verifier.encode()).digest()
+            verifier_challenge = base64.urlsafe_b64encode(verifier_hash).decode().rstrip("=")
+            
+            if verifier_challenge != auth_data["code_challenge"]:
                 raise HTTPException(status_code=400, detail="Invalid code_verifier")
-            print("PKCE verification successful")
-        else:
-            # If no PKCE, validate client credentials
-            if client_id != OAUTH_CLIENT_ID or client_secret != OAUTH_CLIENT_SECRET:
-                print(f"ERROR: Invalid client credentials. client_id match: {client_id == OAUTH_CLIENT_ID}")
-                raise HTTPException(status_code=401, detail="Invalid client credentials")
         
         # Mark code as used
         authorization_codes[code]["used"] = True
         
-        # Create access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": auth_data["client_id"], "scope": auth_data["scope"]},
-            expires_delta=access_token_expires
-        )
+        # Generate tokens
+        access_token = generate_token("mcp_access_")
+        refresh_token = generate_token("mcp_refresh_")
         
-        # Create refresh token
-        refresh_token_value = secrets.token_urlsafe(32)
+        # Store tokens
+        token_data = {
+            "client_id": client_id,
+            "scope": auth_data["scope"],
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(hours=1)
+        }
+        
+        access_tokens[access_token] = token_data.copy()
+        refresh_tokens[refresh_token] = {
+            **token_data,
+            "access_token": access_token,
+            "expires_at": datetime.utcnow() + timedelta(days=30)
+        }
         
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            "refresh_token": refresh_token_value,
+            "expires_in": 3600,  # 1 hour
+            "refresh_token": refresh_token,
             "scope": auth_data["scope"]
         }
     
     elif grant_type == "refresh_token":
-        # Handle refresh token (implement if needed)
-        raise HTTPException(status_code=400, detail="Refresh token not implemented")
+        refresh_token_value = form_data.get("refresh_token")
+        client_id = form_data.get("client_id")
+        client_secret = form_data.get("client_secret")
+        
+        # Validate refresh token
+        if refresh_token_value not in refresh_tokens:
+            raise HTTPException(status_code=400, detail="Invalid refresh token")
+        
+        refresh_data = refresh_tokens[refresh_token_value]
+        
+        # Check expiration
+        if datetime.utcnow() > refresh_data["expires_at"]:
+            del refresh_tokens[refresh_token_value]
+            raise HTTPException(status_code=400, detail="Refresh token expired")
+        
+        # Validate client credentials
+        if client_id != OAUTH_CLIENT_ID or client_secret != OAUTH_CLIENT_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid client credentials")
+        
+        # Revoke old access token
+        old_access_token = refresh_data.get("access_token")
+        if old_access_token in access_tokens:
+            del access_tokens[old_access_token]
+        
+        # Generate new access token
+        new_access_token = generate_token("mcp_access_")
+        
+        token_data = {
+            "client_id": client_id,
+            "scope": refresh_data["scope"],
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(hours=1)
+        }
+        
+        access_tokens[new_access_token] = token_data
+        refresh_tokens[refresh_token_value]["access_token"] = new_access_token
+        
+        return {
+            "access_token": new_access_token,
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh_token_value,
+            "scope": refresh_data["scope"]
+        }
     
     else:
         raise HTTPException(status_code=400, detail="Unsupported grant_type")
 
 
-# Protected MCP SSE Endpoint
-@app.get("/sse")
-async def sse_endpoint(request: Request):
-    """SSE endpoint - protected by OAuth"""
+def verify_access_token(token: str) -> bool:
+    """Verify access token is valid and not expired"""
+    if token not in access_tokens:
+        return False
     
-    # Get authorization header
-    auth_header = request.headers.get("Authorization")
+    token_data = access_tokens[token]
+    if datetime.utcnow() > token_data["expires_at"]:
+        del access_tokens[token]
+        return False
+    
+    return True
+
+
+@app.api_route("/sse", methods=["GET", "POST"])
+async def sse_proxy(request: Request):
+    """
+    Proxy SSE endpoint to internal MCP server
+    Handles authentication via Bearer token
+    """
+    
+    # Extract access token from Authorization header
+    auth_header = request.headers.get("Authorization", "")
+    
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    access_token = auth_header[7:]  # Remove "Bearer " prefix
     
     # Verify token
+    if not verify_access_token(access_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access token",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    # Proxy to internal MCP server
+    target_url = f"{MCP_SERVER_URL}/sse"
+    
     try:
-        user = await get_current_user(auth_header)
-    except HTTPException:
-        # For SSE, we might want to be more lenient during initial connection
-        # Or require token in query params
-        token = request.query_params.get("access_token")
-        if token:
-            try:
-                user = verify_token(token)
-            except:
-                raise HTTPException(status_code=401, detail="Invalid token")
-        else:
-            raise HTTPException(status_code=401, detail="Authentication required")
+        async with httpx.AsyncClient(timeout=None) as client:
+            # Forward the request to the internal MCP server
+            if request.method == "GET":
+                async with client.stream(
+                    "GET",
+                    target_url,
+                    headers={k: v for k, v in request.headers.items() if k.lower() not in ["host", "authorization"]}
+                ) as response:
+                    return StreamingResponse(
+                        response.aiter_bytes(),
+                        status_code=response.status_code,
+                        headers={
+                            "Content-Type": response.headers.get("Content-Type", "text/event-stream"),
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no"
+                        }
+                    )
+            else:  # POST
+                body = await request.body()
+                async with client.stream(
+                    "POST",
+                    target_url,
+                    content=body,
+                    headers={k: v for k, v in request.headers.items() if k.lower() not in ["host", "authorization"]}
+                ) as response:
+                    return StreamingResponse(
+                        response.aiter_bytes(),
+                        status_code=response.status_code,
+                        headers={
+                            "Content-Type": response.headers.get("Content-Type", "text/event-stream"),
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no"
+                        }
+                    )
     
-    # Forward to actual MCP server (running on port 8081)
-    mcp_server_url = os.getenv("MCP_SERVER_URL", "http://localhost:8081/sse")
-    
-    async with httpx.AsyncClient(timeout=None) as client:
-        try:
-            async with client.stream("GET", mcp_server_url) as response:
-                # Stream the SSE response
-                from fastapi.responses import StreamingResponse
-                return StreamingResponse(
-                    response.aiter_bytes(),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
-                    }
-                )
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="MCP server unavailable")
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to MCP server at {MCP_SERVER_URL}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error proxying to MCP server: {str(e)}"
+        )
 
 
-# Health check endpoint (public)
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-
-
-# OAuth metadata endpoint (for Claude Custom Connectors)
-@app.get("/.well-known/oauth-authorization-server")
-async def oauth_metadata():
-    """OAuth 2.0 Authorization Server Metadata"""
-    base_url = os.getenv("BASE_URL", "https://example.com")
+@app.get("/")
+async def root():
+    """Root endpoint with service information"""
     return {
-        "issuer": base_url,
-        "authorization_endpoint": f"{base_url}/authorize",
-        "token_endpoint": f"{base_url}/token",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
-        "code_challenge_methods_supported": ["S256", "plain"],
-        "scopes_supported": ["api"]
+        "service": "OpenProject MCP Server with OAuth",
+        "status": "running",
+        "oauth_spec": "MCP OAuth 6/18",
+        "endpoints": {
+            "metadata": "/.well-known/mcp-oauth-server",
+            "authorize": "/oauth/authorize",
+            "token": "/oauth/token",
+            "sse": "/sse",
+            "health": "/health"
+        },
+        "docs": "/docs"
     }
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("OAuth-Protected OpenProject MCP Server")
-    print("=" * 60)
+    print("=" * 70)
+    print("OpenProject MCP Server with OAuth Authentication")
+    print("=" * 70)
     print(f"OAuth Client ID: {OAUTH_CLIENT_ID}")
-    print(f"OAuth Client Secret: {OAUTH_CLIENT_SECRET[:10]}...")
-    print(f"Authorization Endpoints: /authorize and /oauth/authorize")
-    print(f"Token Endpoints: /token and /oauth/token")
-    print(f"Protected SSE Endpoint: /sse")
-    print(f"PKCE Support: Enabled")
-    print("=" * 60)
+    print(f"OAuth Client Secret: {OAUTH_CLIENT_SECRET[:20]}...")
+    print(f"Claude Callback URL: {CLAUDE_CALLBACK_URL}")
+    print(f"MCP Server URL: {MCP_SERVER_URL}")
+    print("=" * 70)
+    print("\nEndpoints:")
+    print(f"  Metadata: /.well-known/mcp-oauth-server")
+    print(f"  Authorize: /oauth/authorize")
+    print(f"  Token: /oauth/token")
+    print(f"  SSE Proxy: /sse")
+    print(f"  Health: /health")
+    print("=" * 70)
     
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
