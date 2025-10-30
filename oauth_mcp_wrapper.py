@@ -32,6 +32,8 @@ refresh_tokens: Dict[str, Dict[str, Any]] = {}
 # Internal MCP server URL
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://openproject-mcp-server:8081")
 
+BASE_URL = os.getenv("BASE_URL", "https://this.mcpserver.domain")
+
 app = FastAPI(
     title="OpenProject MCP Server with OAuth",
     description="MCP OAuth-protected server for Claude AI",
