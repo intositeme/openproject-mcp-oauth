@@ -42,8 +42,8 @@ async def start_mcp_server():
     global mcp_process, reader_task
     
     # Command to run the OpenProject MCP server
-    # The server is installed in the container at /app
-    command = ["python", "-m", "openproject_mcp_server.main"]
+    # Try different possible entry points
+    command = ["python", "/app/openproject-mcp/scripts/run_server.py"]
     
     logger.info(f"Starting MCP server: {' '.join(command)}")
     
