@@ -357,6 +357,22 @@ def verify_access_token(token: str) -> bool:
     return True
 
 
+async def stream_mcp_response(url: str, method: str, headers: dict, body: bytes = None):
+    """
+    Generator function to stream response from MCP server
+    This keeps the connection alive while streaming
+    """
+    async with httpx.AsyncClient(timeout=None) as client:
+        if method == "GET":
+            async with client.stream("GET", url, headers=headers) as response:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+        else:  # POST
+            async with client.stream("POST", url, content=body, headers=headers) as response:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+
 @app.api_route("/sse", methods=["GET", "POST"])
 async def sse_proxy(request: Request):
     """
@@ -388,42 +404,25 @@ async def sse_proxy(request: Request):
     target_url = f"{MCP_SERVER_URL}/sse"
     
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            # Forward the request to the internal MCP server
-            if request.method == "GET":
-                async with client.stream(
-                    "GET",
-                    target_url,
-                    headers={k: v for k, v in request.headers.items() if k.lower() not in ["host", "authorization"]}
-                ) as response:
-                    return StreamingResponse(
-                        response.aiter_bytes(),
-                        status_code=response.status_code,
-                        headers={
-                            "Content-Type": response.headers.get("Content-Type", "text/event-stream"),
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no"
-                        }
-                    )
-            else:  # POST
-                body = await request.body()
-                async with client.stream(
-                    "POST",
-                    target_url,
-                    content=body,
-                    headers={k: v for k, v in request.headers.items() if k.lower() not in ["host", "authorization"]}
-                ) as response:
-                    return StreamingResponse(
-                        response.aiter_bytes(),
-                        status_code=response.status_code,
-                        headers={
-                            "Content-Type": response.headers.get("Content-Type", "text/event-stream"),
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no"
-                        }
-                    )
+        # Prepare headers to forward (exclude host and authorization)
+        forward_headers = {
+            k: v for k, v in request.headers.items() 
+            if k.lower() not in ["host", "authorization"]
+        }
+        
+        # Get request body for POST requests
+        body = await request.body() if request.method == "POST" else None
+        
+        # Return streaming response with the generator function
+        return StreamingResponse(
+            stream_mcp_response(target_url, request.method, forward_headers, body),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
     
     except httpx.ConnectError:
         raise HTTPException(
