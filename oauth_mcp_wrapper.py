@@ -24,6 +24,8 @@ OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", secrets.token_urlsafe(32)
 CLAUDE_CALLBACK_URL =     "https://claude.ai/api/mcp/auth_callback"
 CLAUDE_CALLBACK_URL_ALT = "https://claude.com/api/mcp/auth_callback"
 CLAUDE_CALLBACK_URL_ALT2 = "https://claude.ai/oauth/callback"
+CLAUDE_CALLBACK_URL_ALT3 = "http://localhost:6274/oauth/callback"
+
 
 # Token storage (use Redis/database in production)
 authorization_codes: Dict[str, Dict[str, Any]] = {}
@@ -65,7 +67,7 @@ def generate_token(prefix: str = "") -> str:
 
 def validate_redirect_uri(redirect_uri: str) -> bool:
     """Validate that redirect URI is from Claude"""
-    allowed_uris = [CLAUDE_CALLBACK_URL, CLAUDE_CALLBACK_URL_ALT, CLAUDE_CALLBACK_URL_ALT2]
+    allowed_uris = [CLAUDE_CALLBACK_URL, CLAUDE_CALLBACK_URL_ALT, CLAUDE_CALLBACK_URL_ALT2, CLAUDE_CALLBACK_URL_ALT3]
     return redirect_uri in allowed_uris
 
 
